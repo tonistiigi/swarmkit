@@ -20,14 +20,13 @@ import (
 	"github.com/coreos/etcd/pkg/idutil"
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
-	"github.com/coreos/etcd/snap"
-	"github.com/coreos/etcd/wal"
 	"github.com/docker/go-events"
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/ca"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/manager/raftselector"
 	"github.com/docker/swarmkit/manager/state/raft/membership"
+	"github.com/docker/swarmkit/manager/state/raft/storage"
 	"github.com/docker/swarmkit/manager/state/store"
 	"github.com/docker/swarmkit/manager/state/watch"
 	"github.com/gogo/protobuf/proto"
@@ -87,8 +86,8 @@ type Node struct {
 	opts                NodeOptions
 	reqIDGen            *idutil.Generator
 	wait                *wait
-	wal                 *wal.WAL
-	snapshotter         *snap.Snapshotter
+	wal                 storage.WAL
+	snapshotter         storage.Snapshotter
 	campaignWhenAble    bool
 	signalledLeadership uint32
 	isMember            uint32
@@ -122,6 +121,7 @@ type Node struct {
 	stopped chan struct{}
 
 	lastSendToMember map[uint64]chan struct{}
+	raftLogger       *storage.EncryptedRaftLogger
 }
 
 // NodeOptions provides node-level options.
@@ -228,7 +228,7 @@ func (n *Node) WithContext(ctx context.Context) (context.Context, context.Cancel
 }
 
 // JoinAndStart joins and starts the raft server
-func (n *Node) JoinAndStart(ctx context.Context) (err error) {
+func (n *Node) JoinAndStart(ctx context.Context, raftEncryptionKey []byte) (err error) {
 	ctx, cancel := n.WithContext(ctx)
 	defer func() {
 		cancel()
@@ -237,8 +237,13 @@ func (n *Node) JoinAndStart(ctx context.Context) (err error) {
 		}
 	}()
 
+	n.raftLogger = &storage.EncryptedRaftLogger{
+		StateDir:      n.opts.StateDir,
+		EncryptionKey: raftEncryptionKey,
+	}
+
 	loadAndStartErr := n.loadAndStart(ctx, n.opts.ForceNewCluster)
-	if loadAndStartErr != nil && loadAndStartErr != errNoWAL {
+	if loadAndStartErr != nil && loadAndStartErr != storage.ErrNoWAL {
 		return loadAndStartErr
 	}
 
@@ -252,7 +257,7 @@ func (n *Node) JoinAndStart(ctx context.Context) (err error) {
 	n.appliedIndex = snapshot.Metadata.Index
 	n.snapshotIndex = snapshot.Metadata.Index
 
-	if loadAndStartErr == errNoWAL {
+	if loadAndStartErr == storage.ErrNoWAL {
 		if n.opts.JoinAddr != "" {
 			c, err := n.ConnectToMember(n.opts.JoinAddr, 10*time.Second)
 			if err != nil {
@@ -274,22 +279,20 @@ func (n *Node) JoinAndStart(ctx context.Context) (err error) {
 
 			n.Config.ID = resp.RaftID
 
-			if _, err := n.createWAL(n.opts.ID); err != nil {
+			if _, err := n.newRaftLogs(n.opts.ID); err != nil {
 				return err
 			}
 
 			n.raftNode = raft.StartNode(n.Config, []raft.Peer{})
 
 			if err := n.registerNodes(resp.Members); err != nil {
-				if walErr := n.wal.Close(); err != nil {
-					log.G(ctx).WithError(walErr).Error("raft: error closing WAL")
-				}
+				n.raftLogger.Close(ctx)
 				return err
 			}
 		} else {
 			// First member in the cluster, self-assign ID
 			n.Config.ID = uint64(rand.Int63()) + 1
-			peer, err := n.createWAL(n.opts.ID)
+			peer, err := n.newRaftLogs(n.opts.ID)
 			if err != nil {
 				return err
 			}
@@ -367,7 +370,7 @@ func (n *Node) Run(ctx context.Context) error {
 		if nodeRemoved {
 			// Move WAL and snapshot out of the way, since
 			// they are no longer usable.
-			if err := n.moveWALAndSnap(); err != nil {
+			if err := n.raftLogger.Clear(ctx); err != nil {
 				log.G(ctx).WithError(err).Error("failed to move wal after node removal")
 			}
 		}
@@ -524,9 +527,7 @@ func (n *Node) stop(ctx context.Context) {
 
 	n.raftNode.Stop()
 	n.ticker.Stop()
-	if err := n.wal.Close(); err != nil {
-		log.G(ctx).WithError(err).Error("raft: failed to close WAL")
-	}
+	n.raftLogger.Close(ctx)
 	atomic.StoreUint32(&n.isMember, 0)
 	// TODO(stevvooe): Handle ctx.Done()
 }
@@ -1133,7 +1134,7 @@ func (n *Node) saveToStorage(raftConfig *api.RaftConfig, hardState raftpb.HardSt
 		}
 	}
 
-	if err := n.wal.Save(hardState, entries); err != nil {
+	if err := n.raftLogger.SaveEntries(hardState, entries); err != nil {
 		// TODO(aaronl): These error types should really wrap more
 		// detailed errors.
 		return ErrApplySnapshot

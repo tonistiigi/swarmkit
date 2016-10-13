@@ -346,7 +346,8 @@ func (m *Manager) Run(parent context.Context) error {
 	// Set the raft server as serving for the health server
 	healthServer.SetServingStatus("Raft", api.HealthCheckResponse_SERVING)
 
-	if err := m.raftNode.JoinAndStart(ctx); err != nil {
+	// TODO (cyli): replace this with a real value
+	if err := m.raftNode.JoinAndStart(ctx, []byte("temp unlock key fixme")); err != nil {
 		return errors.Wrap(err, "can't initialize raft node")
 	}
 

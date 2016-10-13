@@ -594,7 +594,7 @@ func TestRaftUnreachableNode(t *testing.T) {
 	// Add a new node
 	nodes[2] = raftutils.NewNode(t, clockSource, tc, raft.NodeOptions{JoinAddr: nodes[1].Address})
 
-	err := nodes[2].JoinAndStart(ctx)
+	err := nodes[2].JoinAndStart(ctx, nodes[2].RaftEncryptionKey)
 	require.NoError(t, err, "can't join cluster")
 
 	go nodes[2].Run(ctx)
@@ -643,7 +643,7 @@ func TestRaftJoinWithIncorrectAddress(t *testing.T) {
 	n := raftutils.NewNode(t, clockSource, tc, raft.NodeOptions{JoinAddr: nodes[1].Address, Addr: "1.2.3.4:1234"})
 	defer raftutils.CleanupNonRunningNode(n)
 
-	err := n.JoinAndStart(context.Background())
+	err := n.JoinAndStart(context.Background(), n.RaftEncryptionKey)
 	assert.NotNil(t, err)
 	assert.Contains(t, grpc.ErrorDesc(err), "could not connect to prospective new cluster member using its advertised address")
 

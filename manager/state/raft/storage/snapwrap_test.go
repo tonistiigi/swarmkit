@@ -209,3 +209,41 @@ func TestSaveAndLoad(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, fakeSnapshotData, *readSnap)
 }
+
+func TestMigrateSnapshot(t *testing.T) {
+	coder := &meowCoder{}
+	c := NewSnapFactory(coder, coder)
+	var (
+		err  error
+		dirs = make([]string, 3)
+	)
+	for i := 0; i < 3; i++ {
+		dirs[i], err = ioutil.TempDir("", "test-migrate")
+		require.NoError(t, err)
+		defer os.RemoveAll(dirs[i])
+	}
+
+	require.NoError(t, OriginalSnap.New(dirs[0]).SaveSnap(fakeSnapshotData))
+
+	// original to new
+	oldDir := dirs[0]
+	newDir := dirs[1]
+
+	err = MigrateSnapshot(oldDir, newDir, OriginalSnap, c)
+	require.NoError(t, err)
+
+	readSnap, err := c.New(newDir).Load()
+	require.NoError(t, err)
+	require.Equal(t, fakeSnapshotData, *readSnap)
+
+	// new to original
+	oldDir = dirs[1]
+	newDir = dirs[2]
+
+	err = MigrateSnapshot(oldDir, newDir, c, OriginalSnap)
+	require.NoError(t, err)
+
+	readSnap, err = OriginalSnap.New(newDir).Load()
+	require.NoError(t, err)
+	require.Equal(t, fakeSnapshotData, *readSnap)
+}

@@ -1,10 +1,20 @@
 package storage
 
 import (
+	"io"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/Sirupsen/logrus"
+	"github.com/coreos/etcd/pkg/fileutil"
 	"github.com/coreos/etcd/raft/raftpb"
 	"github.com/coreos/etcd/wal"
 	"github.com/coreos/etcd/wal/walpb"
 	"github.com/docker/swarmkit/manager/encryption"
+	"github.com/pkg/errors"
 )
 
 // This package wraps the github.com/coreos/etcd/wal package, and encodes
@@ -128,3 +138,100 @@ func (o originalWAL) Open(dirpath string, walsnap walpb.Snapshot) (WAL, error) {
 
 // OriginalWAL is the original `wal` package as an implemntation of the WALFactory interface
 var OriginalWAL = originalWAL{}
+
+// ReadRepairWAL opens a WAL for reading, and attempts to read it.  If we can't read it, attempts to repair
+// and read again.
+func ReadRepairWAL(walDir string, walsnap walpb.Snapshot, factory WALFactory, logger *logrus.Entry) (
+	WAL, []byte, raftpb.HardState, []raftpb.Entry, error) {
+	var (
+		reader   WAL
+		metadata []byte
+		st       raftpb.HardState
+		ents     []raftpb.Entry
+		err      error
+	)
+	repaired := false
+	for {
+		if reader, err = factory.Open(walDir, walsnap); err != nil {
+			return nil, nil, raftpb.HardState{}, nil, errors.Wrap(err, "failed to open WAL")
+		}
+		if metadata, st, ents, err = reader.ReadAll(); err != nil {
+			if closeErr := reader.Close(); closeErr != nil {
+				return nil, nil, raftpb.HardState{}, nil, closeErr
+			}
+			if _, ok := err.(encryption.ErrCannotDecode); ok {
+				return nil, nil, raftpb.HardState{}, nil, err
+			}
+			// we can only repair ErrUnexpectedEOF and we never repair twice.
+			if repaired || err != io.ErrUnexpectedEOF {
+				return nil, nil, raftpb.HardState{}, nil, errors.Wrap(err, "irreparable WAL error")
+			}
+			if !wal.Repair(walDir) {
+				return nil, nil, raftpb.HardState{}, nil, errors.Wrap(err, "WAL error cannot be repaired")
+			}
+			if logger != nil {
+				logger.WithError(err).Info("repaired WAL error")
+			}
+			repaired = true
+			continue
+		}
+		break
+	}
+	return reader, metadata, st, ents, nil
+}
+
+// MigrateWALs reads existing WALs (from a particular snapshot and beyond) from one directory, encoded one way,
+// and writes them to a new directory, encoded a different way
+func MigrateWALs(oldDir, newDir string, oldFactory, newFactory WALFactory, snapshot walpb.Snapshot, logger *logrus.Entry) error {
+	// keep temporary wal directory so WAL initialization appears atomic
+	tmpdirpath := filepath.Clean(newDir) + ".tmp"
+	if fileutil.Exist(tmpdirpath) {
+		if err := os.RemoveAll(tmpdirpath); err != nil {
+			return errors.Wrap(err, "could not remove temporary WAL directory")
+		}
+	}
+	if err := fileutil.CreateDirAll(tmpdirpath); err != nil {
+		return errors.Wrap(err, "could not create temporary WAL directory")
+	}
+
+	oldReader, metadata, st, ents, err := ReadRepairWAL(oldDir, snapshot, oldFactory, logger)
+	if err != nil {
+		return err
+	}
+	oldReader.Close()
+
+	tmpReader, err := newFactory.Create(tmpdirpath, metadata)
+	if err != nil {
+		return errors.Wrap(err, "could not create new WAL in temporary WAL directory")
+	}
+	defer tmpReader.Close()
+
+	if err := tmpReader.SaveSnapshot(snapshot); err != nil {
+		return errors.Wrap(err, "could not write WAL snapshot in temporary directory")
+	}
+
+	if err := tmpReader.Save(st, ents); err != nil {
+		return errors.Wrap(err, "could not migrate WALs to temporary directory")
+	}
+
+	return os.Rename(tmpdirpath, newDir)
+}
+
+// ListWALs lists all the wals in a directory
+func ListWALs(dirpath string) ([]string, error) {
+	dirents, err := ioutil.ReadDir(dirpath)
+	if err != nil {
+		return nil, err
+	}
+
+	var wals []string
+	for _, dirent := range dirents {
+		if strings.HasSuffix(dirent.Name(), ".wal") {
+			wals = append(wals, dirent.Name())
+		}
+	}
+
+	// Sort WAL filenames in lexical order
+	sort.Sort(sort.StringSlice(wals))
+	return wals, nil
+}

@@ -29,12 +29,13 @@ import (
 // TestNode represents a raft test node
 type TestNode struct {
 	*raft.Node
-	Server         *grpc.Server
-	Listener       *WrappedListener
-	SecurityConfig *ca.SecurityConfig
-	Address        string
-	StateDir       string
-	cancel         context.CancelFunc
+	Server            *grpc.Server
+	Listener          *WrappedListener
+	SecurityConfig    *ca.SecurityConfig
+	Address           string
+	StateDir          string
+	cancel            context.CancelFunc
+	RaftEncryptionKey []byte
 }
 
 // Leader is wrapper around real Leader method to suppress error.
@@ -252,12 +253,13 @@ func NewNode(t *testing.T, clockSource *fakeclock.FakeClock, tc *cautils.TestCA,
 	healthServer.SetServingStatus("Raft", api.HealthCheckResponse_SERVING)
 
 	return &TestNode{
-		Node:           n,
-		Listener:       wrappedListener,
-		SecurityConfig: securityConfig,
-		Address:        newNodeOpts.Addr,
-		StateDir:       newNodeOpts.StateDir,
-		Server:         s,
+		Node:              n,
+		Listener:          wrappedListener,
+		SecurityConfig:    securityConfig,
+		Address:           newNodeOpts.Addr,
+		StateDir:          newNodeOpts.StateDir,
+		Server:            s,
+		RaftEncryptionKey: []byte("test encryption key"),
 	}
 }
 
@@ -269,7 +271,7 @@ func NewInitNode(t *testing.T, tc *cautils.TestCA, raftConfig *api.RaftConfig, o
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
 
-	err := n.Node.JoinAndStart(ctx)
+	err := n.Node.JoinAndStart(ctx, n.RaftEncryptionKey)
 	require.NoError(t, err, "can't join cluster")
 
 	leadershipCh, cancel := n.SubscribeLeadership()
@@ -308,7 +310,7 @@ func NewJoinNode(t *testing.T, clockSource *fakeclock.FakeClock, join string, tc
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
-	err := n.Node.JoinAndStart(ctx)
+	err := n.Node.JoinAndStart(ctx, n.RaftEncryptionKey)
 	require.NoError(t, err, "can't join cluster")
 
 	go n.Run(ctx)
@@ -350,19 +352,20 @@ func RestartNode(t *testing.T, clockSource *fakeclock.FakeClock, oldNode *TestNo
 
 	healthServer.SetServingStatus("Raft", api.HealthCheckResponse_SERVING)
 
-	err := n.JoinAndStart(ctx)
+	err := n.JoinAndStart(ctx, oldNode.RaftEncryptionKey)
 	require.NoError(t, err, "can't join cluster")
 
 	go n.Run(ctx)
 
 	return &TestNode{
-		Node:           n,
-		Listener:       wrappedListener,
-		SecurityConfig: securityConfig,
-		Address:        newNodeOpts.Addr,
-		StateDir:       newNodeOpts.StateDir,
-		cancel:         cancel,
-		Server:         s,
+		Node:              n,
+		Listener:          wrappedListener,
+		SecurityConfig:    securityConfig,
+		Address:           newNodeOpts.Addr,
+		StateDir:          newNodeOpts.StateDir,
+		cancel:            cancel,
+		Server:            s,
+		RaftEncryptionKey: oldNode.RaftEncryptionKey,
 	}
 }
 

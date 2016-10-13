@@ -3,7 +3,6 @@ package raft_test
 import (
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -12,7 +11,6 @@ import (
 	"github.com/docker/swarmkit/api"
 	raftutils "github.com/docker/swarmkit/manager/state/raft/testutils"
 	"github.com/docker/swarmkit/manager/state/store"
-	"github.com/pivotal-golang/clock/fakeclock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/context"
@@ -435,25 +433,4 @@ func proposeLargeValue(t *testing.T, raftNode *raftutils.TestNode, time time.Dur
 	}
 
 	return node, nil
-}
-
-func TestMigrateWAL(t *testing.T) {
-	nodes := make(map[uint64]*raftutils.TestNode)
-	var clockSource *fakeclock.FakeClock
-
-	nodes[1], clockSource = raftutils.NewInitNode(t, tc, nil)
-	defer raftutils.TeardownCluster(t, nodes)
-
-	value, err := raftutils.ProposeValue(t, nodes[1], DefaultProposalTime, "id1")
-	assert.NoError(t, err, "failed to propose value")
-	raftutils.CheckValuesOnNodes(t, clockSource, nodes, []string{"id1"}, []*api.Node{value})
-
-	nodes[1].Server.Stop()
-	nodes[1].ShutdownRaft()
-
-	// Move WAL directory so it looks like it was created by an old version
-	require.NoError(t, os.Rename(filepath.Join(nodes[1].StateDir, "wal-v3"), filepath.Join(nodes[1].StateDir, "wal")))
-
-	nodes[1] = raftutils.RestartNode(t, clockSource, nodes[1], false)
-	raftutils.CheckValuesOnNodes(t, clockSource, nodes, []string{"id1"}, []*api.Node{value})
 }
