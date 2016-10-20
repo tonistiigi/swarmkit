@@ -186,8 +186,13 @@ func (n *Node) doSnapshot(ctx context.Context, raftConfig api.RaftConfig) {
 // This sees if there are any keys queued to be rotated if so it saves the snapshot and trims
 // the key queue. Otherwise, it just saves the snapshot.
 func (n *Node) saveSnapshot(snapshot raftpb.Snapshot, keepOldSnapshots uint64) error {
-	if err := n.raftLogger.SaveSnapshot(snapshot, nil); err != nil {
+	latest := n.keyQueue.Latest()
+	if err := n.raftLogger.SaveSnapshot(snapshot, latest); err != nil {
 		return err
+	}
+	if latest != nil {
+		n.finishedKeyRotationCh <- latest
+		n.keyQueue.Dequeue(latest)
 	}
 	return n.raftLogger.GC(snapshot.Metadata.Index, snapshot.Metadata.Term, keepOldSnapshots)
 }

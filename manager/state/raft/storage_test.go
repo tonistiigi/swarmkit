@@ -11,6 +11,7 @@ import (
 	"github.com/docker/swarmkit/api"
 	raftutils "github.com/docker/swarmkit/manager/state/raft/testutils"
 	"github.com/docker/swarmkit/manager/state/store"
+	"github.com/pivotal-golang/clock/fakeclock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/context"
@@ -116,7 +117,7 @@ func TestRaftSnapshot(t *testing.T) {
 				return fmt.Errorf("expected 1 snapshot, found %d on node %d", len(dirents), nodeID)
 			}
 			if dirents[0].Name() == snapshotFilenames[nodeID] {
-				return fmt.Errorf("snapshot %s did not get replaced", snapshotFilenames[nodeID])
+				return fmt.Errorf("snapshot %s did not get replaced on node %d", snapshotFilenames[nodeID], nodeID)
 			}
 			return nil
 		}))
@@ -433,4 +434,63 @@ func proposeLargeValue(t *testing.T, raftNode *raftutils.TestNode, time time.Dur
 	}
 
 	return node, nil
+}
+
+func TestRaftEncryptionKeyRotation(t *testing.T) {
+	t.Parallel()
+
+	nodes := make(map[uint64]*raftutils.TestNode)
+	var clockSource *fakeclock.FakeClock
+
+	nodes[1], clockSource = raftutils.NewInitNode(t, tc, nil)
+	defer raftutils.TeardownCluster(t, nodes)
+
+	nodeIDs := []string{"id1", "id2", "id3", "id4"}
+	values := make([]*api.Node, len(nodeIDs))
+
+	// Propose 3 values
+	var err error
+	for i, nodeID := range nodeIDs[:3] {
+		values[i], err = raftutils.ProposeValue(t, nodes[1], DefaultProposalTime, nodeID)
+		require.NoError(t, err, "failed to propose value")
+	}
+
+	// rotate the encryption key
+	startRotate, finishRotate := nodes[1].Node.Rotations()
+	startRotate <- []byte("key2")
+
+	// the rotation should trigger a snapshot
+	require.NoError(t, raftutils.PollFunc(clockSource, func() error {
+		dirents, err := ioutil.ReadDir(filepath.Join(nodes[1].StateDir, "snap-v3"))
+		if err != nil {
+			return err
+		}
+		if len(dirents) != 1 {
+			return fmt.Errorf("expected 1 snapshot, found %d on new node", len(dirents))
+		}
+		return nil
+	}))
+
+	require.Equal(t, []byte("key2"), <-finishRotate)
+	raftutils.CheckValuesOnNodes(t, clockSource, nodes, nodeIDs[:3], values[:3])
+
+	// Propose a 4th value
+	values[3], err = raftutils.ProposeValue(t, nodes[1], DefaultProposalTime, nodeIDs[3])
+	require.NoError(t, err, "failed to propose value")
+	raftutils.CheckValuesOnNodes(t, clockSource, nodes, nodeIDs, values)
+
+	nodes[1].Server.Stop()
+	nodes[1].ShutdownRaft()
+
+	// Try to restart node 1. Without the new unlock key, it can't actually start
+	n, ctx := raftutils.CopyNode(t, clockSource, nodes[1], false)
+	require.Error(t, n.Node.JoinAndStart(ctx, nodes[1].RaftEncryptionKey), "should not have been able to restart since we can't read snapshots")
+
+	// with the right key, it can start, even if the right key is only an old decryption key
+	nodes[1].RaftEncryptionKey = []byte("key2")
+	nodes[1] = raftutils.RestartNode(t, clockSource, nodes[1], false)
+
+	raftutils.WaitForCluster(t, clockSource, nodes)
+
+	raftutils.CheckValuesOnNodes(t, clockSource, nodes, nodeIDs, values)
 }
