@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/x509"
 	_ "expvar"
 	"fmt"
 	"net"
@@ -16,6 +17,7 @@ import (
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/node"
 	"github.com/docker/swarmkit/version"
+	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
 )
@@ -117,6 +119,15 @@ var (
 				return err
 			}
 
+			unlockKeyStr, err := cmd.Flags().GetString("unlock-key")
+			if err != nil {
+				return err
+			}
+			var unlockKey []byte
+			if len(unlockKeyStr) > 0 {
+				unlockKey = []byte(unlockKeyStr)
+			}
+
 			// Create a cancellable context for our GRPC call
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
@@ -149,8 +160,14 @@ var (
 				Executor:         executor,
 				HeartbeatTick:    hb,
 				ElectionTick:     election,
+				UnlockKey:        unlockKey,
 			})
 			if err != nil {
+				if unlockKey != nil && errors.Cause(err) == x509.IncorrectPasswordError {
+					return errors.New("invalid password provided to unlock swarm")
+				} else if unlockKey == nil && errors.Cause(err).Error() == "tls: failed to parse private key" { // todo: better to export typed error
+					return errors.New("raft state is locked and requires unlock key")
+				}
 				return err
 			}
 
@@ -191,6 +208,7 @@ func init() {
 	mainCmd.Flags().String("listen-control-api", "./swarmkitstate/swarmd.sock", "Listen socket for control API")
 	mainCmd.Flags().String("listen-debug", "", "Bind the Go debug server on the provided address")
 	mainCmd.Flags().String("join-addr", "", "Join cluster with a node at this address")
+	mainCmd.Flags().String("unlock-key", "", "Key for encrypting raft storage")
 	mainCmd.Flags().Bool("force-new-cluster", false, "Force the creation of a new cluster from data directory")
 	mainCmd.Flags().Uint32("heartbeat-tick", 1, "Defines the heartbeat interval (in seconds) for raft member health-check")
 	mainCmd.Flags().Uint32("election-tick", 3, "Defines the amount of ticks (in seconds) needed without a Leader to trigger a new election")
