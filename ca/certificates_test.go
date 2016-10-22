@@ -23,6 +23,7 @@ import (
 	"github.com/docker/swarmkit/manager/state/store"
 	"github.com/phayes/permbits"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/net/context"
 )
 
@@ -293,6 +294,49 @@ func TestRequestAndSaveNewCertificates(t *testing.T) {
 	assert.False(t, perms.GroupWrite())
 	assert.False(t, perms.OtherWrite())
 	assert.NotEmpty(t, <-info)
+
+	// there was no encryption config in the remote, so the key should be unencrypted
+	unencryptedKeyReader := ca.NewKeyReadWriter(tc.Paths.Node, nil)
+	_, _, err = unencryptedKeyReader.Read()
+	require.NoError(t, err)
+
+	// the worker token is also unencrypted
+	cert, err = rca.RequestAndSaveNewCertificates(tc.Context, tc.KeyReadWriter, tc.WorkerToken, tc.Remotes, nil, info)
+	assert.NoError(t, err)
+	assert.NotNil(t, cert)
+	assert.NotEmpty(t, <-info)
+	_, _, err = unencryptedKeyReader.Read()
+	require.NoError(t, err)
+
+	// If there is a different kek in the remote store, when TLS certs are renewed the new key will
+	// be encrypted with that kek
+	assert.NoError(t, tc.MemoryStore.Update(func(tx store.Tx) error {
+		cluster := store.GetCluster(tx, tc.Organization)
+		cluster.Spec.EncryptionConfig = api.EncryptionConfig{
+			ManagerUnlockKey: []byte("kek!"),
+		}
+		return store.UpdateCluster(tx, cluster)
+	}))
+	assert.NoError(t, os.RemoveAll(tc.Paths.Node.Cert))
+	assert.NoError(t, os.RemoveAll(tc.Paths.Node.Key))
+
+	_, err = rca.RequestAndSaveNewCertificates(tc.Context, tc.KeyReadWriter, tc.ManagerToken, tc.Remotes, nil, info)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, <-info)
+
+	// key can no longer be read without a kek
+	_, _, err = unencryptedKeyReader.Read()
+	require.Error(t, err)
+
+	_, _, err = ca.NewKeyReadWriter(tc.Paths.Node, []byte("kek!")).Read()
+	require.NoError(t, err)
+
+	// if it's a worker though, the key is always unencrypted, even though the manager key is encrypted
+	_, err = rca.RequestAndSaveNewCertificates(tc.Context, tc.KeyReadWriter, tc.WorkerToken, tc.Remotes, nil, info)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, <-info)
+	_, _, err = unencryptedKeyReader.Read()
+	require.NoError(t, err)
 }
 
 func TestIssueAndSaveNewCertificates(t *testing.T) {

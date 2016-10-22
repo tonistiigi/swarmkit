@@ -307,3 +307,33 @@ func TestNewNodeCertificateBadToken(t *testing.T) {
 	_, err = tc.NodeCAClients[0].IssueNodeCertificate(context.Background(), issueRequest)
 	assert.EqualError(t, err, "rpc error: code = 3 desc = A valid join token is necessary to join this cluster")
 }
+
+func TestGetEncryptionConfig(t *testing.T) {
+	t.Parallel()
+
+	tc := testutils.NewTestCA(t)
+	defer tc.Stop()
+
+	resp, err := tc.NodeCAClients[0].GetEncryptionConfig(context.Background(), &api.GetEncryptionConfigRequest{})
+	assert.NoError(t, err)
+	assert.NotNil(t, resp.EncryptionConfig)
+	assert.Equal(t, api.EncryptionConfig{}, *resp.EncryptionConfig)
+
+	for _, passphrase := range [][]byte{nil, []byte("secret")} {
+		// Update encryption config
+		assert.NoError(t, tc.MemoryStore.Update(func(tx store.Tx) error {
+			clusters, _ := store.FindClusters(tx, store.ByName(store.DefaultClusterName))
+			clusters[0].Spec.EncryptionConfig = api.EncryptionConfig{
+				ManagerUnlockKey: passphrase,
+			}
+			return store.UpdateCluster(tx, clusters[0])
+		}))
+
+		time.Sleep(500 * time.Millisecond)
+
+		resp, err = tc.NodeCAClients[0].GetEncryptionConfig(context.Background(), &api.GetEncryptionConfigRequest{})
+		assert.NoError(t, err)
+		assert.NotNil(t, resp.EncryptionConfig)
+		assert.Equal(t, passphrase, resp.EncryptionConfig.ManagerUnlockKey)
+	}
+}

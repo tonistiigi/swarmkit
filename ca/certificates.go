@@ -200,11 +200,60 @@ func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, kw KeyWrit
 		return nil, err
 	}
 
-	if err := kw.Write(signedCert, key, nil); err != nil {
+	kekUpdate, err := rca.getKEKUpdate(ctx, X509Cert, tlsKeyPair, r)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := kw.Write(signedCert, key, kekUpdate); err != nil {
 		return nil, err
 	}
 
 	return &tlsKeyPair, nil
+}
+
+func (rca *RootCA) getKEKUpdate(ctx context.Context, cert *x509.Certificate, keypair tls.Certificate, r remotes.Remotes) (*KEKUpdate, error) {
+	var managerRole bool
+	for _, ou := range cert.Subject.OrganizationalUnit {
+		if ou == WorkerRole {
+			// If this is a worker set to never encrypt. We always want to set to nil, in case this was a manager that was demoted
+			// to a worker.
+			return &KEKUpdate{}, nil
+		}
+		if ou == ManagerRole {
+			managerRole = true
+			break
+		}
+	}
+
+	if !managerRole {
+		// This technically shouldn't happen, since the role should either be manager or role, but
+		// role validation will happen later.  We just won't update KEKs if it's neither a worker or
+		// manager.
+		return nil, nil
+	}
+
+	mtlsCreds := credentials.NewTLS(&tls.Config{ServerName: CARole, RootCAs: rca.Pool, Certificates: []tls.Certificate{keypair}})
+	conn, peer, err := getGRPCConnection(mtlsCreds, r)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	client := api.NewNodeCAClient(conn)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	response, err := client.GetEncryptionConfig(ctx, &api.GetEncryptionConfigRequest{})
+	if err != nil {
+		r.Observe(peer, -remotes.DefaultObservationWeight)
+		return nil, err
+	}
+	r.Observe(peer, remotes.DefaultObservationWeight)
+	update := KEKUpdate{}
+	if response.EncryptionConfig != nil {
+		update.KEK = response.EncryptionConfig.ManagerUnlockKey
+	}
+	return &update, nil
 }
 
 // PrepareCSR creates a CFSSL Sign Request based on the given raw CSR and
@@ -393,24 +442,32 @@ func GetLocalRootCA(baseDir string) (RootCA, error) {
 	return NewRootCA(cert, key, DefaultNodeCertExpiration)
 }
 
+func getGRPCConnection(creds credentials.TransportCredentials, r remotes.Remotes) (*grpc.ClientConn, api.Peer, error) {
+	peer, err := r.Select()
+	if err != nil {
+		return nil, api.Peer{}, err
+	}
+
+	opts := []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithTimeout(5 * time.Second),
+		grpc.WithBackoffMaxDelay(5 * time.Second),
+	}
+
+	conn, err := grpc.Dial(peer.Addr, opts...)
+	if err != nil {
+		return nil, api.Peer{}, err
+	}
+	return conn, peer, nil
+}
+
 // GetRemoteCA returns the remote endpoint's CA certificate
 func GetRemoteCA(ctx context.Context, d digest.Digest, r remotes.Remotes) (RootCA, error) {
 	// This TLS Config is intentionally using InsecureSkipVerify. Either we're
 	// doing TOFU, in which case we don't validate the remote CA, or we're using
 	// a user supplied hash to check the integrity of the CA certificate.
 	insecureCreds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecureCreds),
-		grpc.WithTimeout(5 * time.Second),
-		grpc.WithBackoffMaxDelay(5 * time.Second),
-	}
-
-	peer, err := r.Select()
-	if err != nil {
-		return RootCA{}, err
-	}
-
-	conn, err := grpc.Dial(peer.Addr, opts...)
+	conn, peer, err := getGRPCConnection(insecureCreds, r)
 	if err != nil {
 		return RootCA{}, err
 	}
@@ -543,18 +600,7 @@ func GetRemoteSignedCertificate(ctx context.Context, csr []byte, token string, r
 		creds = credentials.NewTLS(&tls.Config{ServerName: CARole, RootCAs: rootCAPool})
 	}
 
-	peer, err := r.Select()
-	if err != nil {
-		return nil, err
-	}
-
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(creds),
-		grpc.WithTimeout(5 * time.Second),
-		grpc.WithBackoffMaxDelay(5 * time.Second),
-	}
-
-	conn, err := grpc.Dial(peer.Addr, opts...)
+	conn, peer, err := getGRPCConnection(creds, r)
 	if err != nil {
 		return nil, err
 	}
