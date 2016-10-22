@@ -122,8 +122,8 @@ func (rca *RootCA) CanSign() bool {
 
 // IssueAndSaveNewCertificates generates a new key-pair, signs it with the local root-ca, and returns a
 // tls certificate
-func (rca *RootCA) IssueAndSaveNewCertificates(paths CertPaths, cn, ou, org string) (*tls.Certificate, error) {
-	csr, key, err := GenerateAndWriteNewKey(paths)
+func (rca *RootCA) IssueAndSaveNewCertificates(kw KeyWriter, cn, ou, org string) (*tls.Certificate, error) {
+	csr, key, err := GenerateNewCSR()
 	if err != nil {
 		return nil, errors.Wrap(err, "error when generating new node certs")
 	}
@@ -138,20 +138,13 @@ func (rca *RootCA) IssueAndSaveNewCertificates(paths CertPaths, cn, ou, org stri
 		return nil, errors.Wrap(err, "failed to sign node certificate")
 	}
 
-	// Ensure directory exists
-	err = os.MkdirAll(filepath.Dir(paths.Cert), 0755)
-	if err != nil {
-		return nil, err
-	}
-
-	// Write the chain to disk
-	if err := ioutils.AtomicWriteFile(paths.Cert, certChain, 0644); err != nil {
-		return nil, err
-	}
-
 	// Create a valid TLSKeyPair out of the PEM encoded private key and certificate
 	tlsKeyPair, err := tls.X509KeyPair(certChain, key)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := kw.Write(certChain, key, nil); err != nil {
 		return nil, err
 	}
 
@@ -160,11 +153,9 @@ func (rca *RootCA) IssueAndSaveNewCertificates(paths CertPaths, cn, ou, org stri
 
 // RequestAndSaveNewCertificates gets new certificates issued, either by signing them locally if a signer is
 // available, or by requesting them from the remote server at remoteAddr.
-func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths CertPaths, token string, remotes remotes.Remotes, transport credentials.TransportCredentials, nodeInfo chan<- api.IssueNodeCertificateResponse) (*tls.Certificate, error) {
+func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, kw KeyWriter, token string, r remotes.Remotes, transport credentials.TransportCredentials, nodeInfo chan<- api.IssueNodeCertificateResponse) (*tls.Certificate, error) {
 	// Create a new key/pair and CSR for the new manager
-	// Write the new CSR and the new key to a temporary location so we can survive crashes on rotation
-	tempPaths := genTempPaths(paths)
-	csr, key, err := GenerateAndWriteNewKey(tempPaths)
+	csr, key, err := GenerateNewCSR()
 	if err != nil {
 		return nil, errors.Wrap(err, "error when generating new node certs")
 	}
@@ -174,7 +165,7 @@ func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths Cert
 	// responding properly (for example, it may have just been demoted).
 	var signedCert []byte
 	for i := 0; i != 5; i++ {
-		signedCert, err = GetRemoteSignedCertificate(ctx, csr, token, rca.Pool, remotes, transport, nodeInfo)
+		signedCert, err = GetRemoteSignedCertificate(ctx, csr, token, rca.Pool, r, transport, nodeInfo)
 		if err == nil {
 			break
 		}
@@ -184,7 +175,7 @@ func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths Cert
 	}
 
 	// Доверяй, но проверяй.
-	// Before we overwrite our local certificate, let's make sure the server gave us one that is valid
+	// Before we overwrite our local key + certificate, let's make sure the server gave us one that is valid
 	// Create an X509Cert so we can .Verify()
 	certBlock, _ := pem.Decode(signedCert)
 	if certBlock == nil {
@@ -209,19 +200,7 @@ func (rca *RootCA) RequestAndSaveNewCertificates(ctx context.Context, paths Cert
 		return nil, err
 	}
 
-	// Ensure directory exists
-	err = os.MkdirAll(filepath.Dir(paths.Cert), 0755)
-	if err != nil {
-		return nil, err
-	}
-
-	// Write the chain to disk
-	if err := ioutils.AtomicWriteFile(paths.Cert, signedCert, 0644); err != nil {
-		return nil, err
-	}
-
-	// Move the new key to the final location
-	if err := os.Rename(tempPaths.Key, paths.Key); err != nil {
+	if err := kw.Write(signedCert, key, nil); err != nil {
 		return nil, err
 	}
 
@@ -497,17 +476,9 @@ func CreateAndWriteRootCA(rootCN string, paths CertPaths) (RootCA, error) {
 		return RootCA{}, err
 	}
 
-	// Ensure directory exists
-	err = os.MkdirAll(filepath.Dir(paths.Cert), 0755)
-	if err != nil {
-		return RootCA{}, err
-	}
-
-	// Write the Private Key and Certificate to disk, using decent permissions
-	if err := ioutils.AtomicWriteFile(paths.Cert, cert, 0644); err != nil {
-		return RootCA{}, err
-	}
-	if err := ioutils.AtomicWriteFile(paths.Key, key, 0600); err != nil {
+	// TODO (cyli):  for backwards compatibility, we are writing the key to disk
+	// unencrypted.  We may want to just not write the key to disk at all.
+	if err := NewKeyReadWriter(paths, nil).Write(cert, key, nil); err != nil {
 		return RootCA{}, err
 	}
 
@@ -516,7 +487,7 @@ func CreateAndWriteRootCA(rootCN string, paths CertPaths) (RootCA, error) {
 
 // BootstrapCluster receives a directory and creates both new Root CA key material
 // and a ManagerRole key/certificate pair to be used by the initial cluster manager
-func BootstrapCluster(baseCertDir string) error {
+func BootstrapCluster(baseCertDir string, kw KeyWriter) error {
 	paths := NewConfigPaths(baseCertDir)
 
 	rootCA, err := CreateAndWriteRootCA(rootCN, paths.RootCA)
@@ -526,17 +497,16 @@ func BootstrapCluster(baseCertDir string) error {
 
 	nodeID := identity.NewID()
 	newOrg := identity.NewID()
-	_, err = GenerateAndSignNewTLSCert(rootCA, nodeID, ManagerRole, newOrg, paths.Node)
-
+	_, err = GenerateAndSignNewTLSCert(rootCA, nodeID, ManagerRole, newOrg, kw)
 	return err
 }
 
 // GenerateAndSignNewTLSCert creates a new keypair, signs the certificate using signer,
 // and saves the certificate and key to disk. This method is used to bootstrap the first
 // manager TLS certificates.
-func GenerateAndSignNewTLSCert(rootCA RootCA, cn, ou, org string, paths CertPaths) (*tls.Certificate, error) {
+func GenerateAndSignNewTLSCert(rootCA RootCA, cn, ou, org string, kw KeyWriter) (*tls.Certificate, error) {
 	// Generate and new keypair and CSR
-	csr, key, err := generateNewCSR()
+	csr, key, err := GenerateNewCSR()
 	if err != nil {
 		return nil, err
 	}
@@ -547,49 +517,17 @@ func GenerateAndSignNewTLSCert(rootCA RootCA, cn, ou, org string, paths CertPath
 		return nil, errors.Wrap(err, "failed to sign node certificate")
 	}
 
-	// Ensure directory exists
-	err = os.MkdirAll(filepath.Dir(paths.Cert), 0755)
-	if err != nil {
-		return nil, err
-	}
-
-	// Write both the chain and key to disk
-	if err := ioutils.AtomicWriteFile(paths.Cert, certChain, 0644); err != nil {
-		return nil, err
-	}
-	if err := ioutils.AtomicWriteFile(paths.Key, key, 0600); err != nil {
-		return nil, err
-	}
-
 	// Load a valid tls.Certificate from the chain and the key
 	serverCert, err := tls.X509KeyPair(certChain, key)
 	if err != nil {
 		return nil, err
 	}
 
+	if err := kw.Write(certChain, key, nil); err != nil {
+		return nil, err
+	}
+
 	return &serverCert, nil
-}
-
-// GenerateAndWriteNewKey generates a new pub/priv key pair, writes it to disk
-// and returns the CSR and the private key material
-func GenerateAndWriteNewKey(paths CertPaths) (csr, key []byte, err error) {
-	// Generate a new key pair
-	csr, key, err = generateNewCSR()
-	if err != nil {
-		return
-	}
-
-	// Ensure directory exists
-	err = os.MkdirAll(filepath.Dir(paths.Key), 0755)
-	if err != nil {
-		return
-	}
-
-	if err = ioutils.AtomicWriteFile(paths.Key, key, 0600); err != nil {
-		return
-	}
-
-	return
 }
 
 // GetRemoteSignedCertificate submits a CSR to a remote CA server address,
@@ -713,7 +651,8 @@ func saveRootCA(rootCA RootCA, paths CertPaths) error {
 	return ioutils.AtomicWriteFile(paths.Cert, rootCA.Cert, 0644)
 }
 
-func generateNewCSR() (csr, key []byte, err error) {
+// GenerateNewCSR returns a newly generated key and CSR signed with said key
+func GenerateNewCSR() (csr, key []byte, err error) {
 	req := &cfcsr.CertificateRequest{
 		KeyRequest: cfcsr.NewBasicKeyRequest(),
 	}
