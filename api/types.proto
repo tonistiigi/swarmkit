@@ -802,3 +802,17 @@ message RemovedNode {
 	// was issued to this node.
 	Timestamp expiry = 2;
 }
+
+message EncryptedRecord {
+	enum Algorithm {
+		option (gogoproto.goproto_enum_prefix) = false;
+		option (gogoproto.enum_customname) = "Algorithm";
+
+		NONE = 0 [(gogoproto.enumvalue_customname) = "NotEncrypted"];
+		SECRETBOX_SALSA20_POLY1305 = 1 [(gogoproto.enumvalue_customname) = "NaclSecretboxSalsa20Poly1305"];
+	}
+
+	Algorithm algorithm = 1;
+	bytes data = 2;
+	bytes nonce = 3;
+}
