@@ -36,6 +36,7 @@ type TestNode struct {
 	StateDir          string
 	cancel            context.CancelFunc
 	RaftEncryptionKey []byte
+	KeyRotator        raft.EncryptionKeyRotator
 }
 
 // Leader is wrapper around real Leader method to suppress error.
@@ -234,6 +235,7 @@ func NewNode(t *testing.T, clockSource *fakeclock.FakeClock, tc *cautils.TestCA,
 	}
 	if len(opts) == 1 {
 		newNodeOpts.JoinAddr = opts[0].JoinAddr
+		newNodeOpts.KeyRotator = opts[0].KeyRotator
 		if opts[0].Addr != "" {
 			newNodeOpts.Addr = opts[0].Addr
 		}
@@ -260,6 +262,7 @@ func NewNode(t *testing.T, clockSource *fakeclock.FakeClock, tc *cautils.TestCA,
 		StateDir:          newNodeOpts.StateDir,
 		Server:            s,
 		RaftEncryptionKey: []byte("test encryption key"),
+		KeyRotator:        newNodeOpts.KeyRotator,
 	}
 }
 
@@ -336,6 +339,7 @@ func CopyNode(t *testing.T, clockSource *fakeclock.FakeClock, oldNode *TestNode,
 		ClockSource:     clockSource,
 		SendTimeout:     10 * time.Second,
 		TLSCredentials:  securityConfig.ClientTLSCreds,
+		KeyRotator:      oldNode.KeyRotator,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -361,6 +365,7 @@ func CopyNode(t *testing.T, clockSource *fakeclock.FakeClock, oldNode *TestNode,
 		cancel:            cancel,
 		Server:            s,
 		RaftEncryptionKey: oldNode.RaftEncryptionKey,
+		KeyRotator:        oldNode.KeyRotator,
 	}, ctx
 }
 

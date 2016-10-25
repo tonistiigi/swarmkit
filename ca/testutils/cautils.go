@@ -95,7 +95,7 @@ var External bool
 
 // NewTestCA is a helper method that creates a TestCA and a bunch of default
 // connections and security configs.
-func NewTestCA(t *testing.T) *TestCA {
+func NewTestCA(t *testing.T, keks ...[]byte) *TestCA {
 	tempBaseDir, err := ioutil.TempDir("", "swarm-ca-test-")
 	assert.NoError(t, err)
 
@@ -124,7 +124,11 @@ func NewTestCA(t *testing.T) *TestCA {
 		}
 	}
 
-	krw := ca.NewKeyReadWriter(paths.Node, nil, nil)
+	var kek []byte
+	if len(keks) > 0 {
+		kek = keks[0]
+	}
+	krw := ca.NewKeyReadWriter(paths.Node, kek, nil)
 
 	managerConfig, err := genSecurityConfig(s, rootCA, krw, ca.ManagerRole, organization, "", External)
 	assert.NoError(t, err)

@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"bytes"
 	"fmt"
 	"math"
 	"math/rand"
@@ -75,37 +74,11 @@ const (
 	IsFollower
 )
 
-// We need to enqueue keys to rotate, because a key rotation involves successfully
-// taking a snapshot using the new key.  However, a snapshot may already be in
-// progress, hence the queue (of length 1).  This assumes that valid encryption
-// keys are never empty (we use an empty key to indicate no key rotation needed).
-type encryptionKeyQueue struct {
-	mu     sync.RWMutex
-	newKey []byte
-}
-
-func (e *encryptionKeyQueue) Enqueue(newKey []byte) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.newKey = newKey
-}
-
-func (e *encryptionKeyQueue) Latest() []byte {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.newKey
-}
-
-func (e *encryptionKeyQueue) Dequeue(key []byte) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	// we need to compare the just-rotated key with the desired key, because of
-	// the possibility a new key rotation in while we were still rotating the
-	// previous key
-	if bytes.Equal(e.newKey, key) {
-		e.newKey = nil
-	}
+// EncryptionKeyRotator is an interface to find out if any keys need rotating.
+type EncryptionKeyRotator interface {
+	GetNewKey() []byte
+	FinishKeyRotation([]byte) error
+	RotationNotify() chan struct{}
 }
 
 // Node represents the Raft Node useful
@@ -157,9 +130,7 @@ type Node struct {
 	lastSendToMember map[uint64]chan struct{}
 	raftLogger       *storage.EncryptedRaftLogger
 
-	rotateEncryptionKeyCh chan []byte
-	finishedKeyRotationCh chan []byte
-	keyQueue              encryptionKeyQueue
+	keyRotator EncryptionKeyRotator
 }
 
 // NodeOptions provides node-level options.
@@ -188,6 +159,10 @@ type NodeOptions struct {
 	// nodes. Leave this as 0 to get the default value.
 	SendTimeout    time.Duration
 	TLSCredentials credentials.TransportCredentials
+
+	// KeyRotator provides an EncryptionKeyRotator interface, so that the key for
+	// raft at rest encryption can be rotated
+	KeyRotator EncryptionKeyRotator
 }
 
 func init() {
@@ -226,9 +201,6 @@ func NewNode(opts NodeOptions) *Node {
 		stopped:             make(chan struct{}),
 		leadershipBroadcast: watch.NewQueue(),
 		lastSendToMember:    make(map[uint64]chan struct{}),
-
-		rotateEncryptionKeyCh: make(chan []byte, 2),
-		finishedKeyRotationCh: make(chan []byte, 2),
 	}
 	n.memoryStore = store.NewMemoryStore(n)
 
@@ -420,6 +392,11 @@ func (n *Node) Run(ctx context.Context) error {
 
 	wasLeader := false
 
+	var rotationNotification chan struct{}
+	if n.opts.KeyRotator != nil {
+		rotationNotification = n.opts.KeyRotator.RotationNotify()
+	}
+
 	for {
 		select {
 		case <-n.ticker.C():
@@ -534,13 +511,12 @@ func (n *Node) Run(ctx context.Context) error {
 				n.snapshotIndex = snapshotIndex
 			}
 			n.snapshotInProgress = nil
-			if n.keyQueue.Latest() != nil {
+			if n.opts.KeyRotator != nil && n.opts.KeyRotator.GetNewKey() != nil {
 				// there was a key rotation that took place before while the snapshot
 				// was in progress - we have to take another snapshot and encrypt with the new key
 				n.doSnapshot(ctx, n.getCurrentRaftConfig())
 			}
-		case keyUpdate := <-n.rotateEncryptionKeyCh:
-			n.keyQueue.Enqueue(keyUpdate)
+		case <-rotationNotification:
 			if n.snapshotInProgress == nil {
 				n.doSnapshot(ctx, n.getCurrentRaftConfig())
 			}
@@ -570,12 +546,6 @@ func (n *Node) getCurrentRaftConfig() api.RaftConfig {
 // Done returns channel which is closed when raft node is fully stopped.
 func (n *Node) Done() <-chan struct{} {
 	return n.doneCh
-}
-
-// Rotations returns a channel through which one can trigger a key rotation, and
-// a channel that updates when key rotations are done
-func (n *Node) Rotations() (chan []byte, chan []byte) {
-	return n.rotateEncryptionKeyCh, n.finishedKeyRotationCh
 }
 
 func (n *Node) stop(ctx context.Context) {
