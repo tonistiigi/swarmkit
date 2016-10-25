@@ -535,7 +535,7 @@ func CreateAndWriteRootCA(rootCN string, paths CertPaths) (RootCA, error) {
 
 	// TODO (cyli):  for backwards compatibility, we are writing the key to disk
 	// unencrypted.  We may want to just not write the key to disk at all.
-	if err := NewKeyReadWriter(paths, nil).Write(cert, key, nil); err != nil {
+	if err := NewKeyReadWriter(paths, nil, nil).Write(cert, key, nil); err != nil {
 		return RootCA{}, err
 	}
 
@@ -544,7 +544,7 @@ func CreateAndWriteRootCA(rootCN string, paths CertPaths) (RootCA, error) {
 
 // BootstrapCluster receives a directory and creates both new Root CA key material
 // and a ManagerRole key/certificate pair to be used by the initial cluster manager
-func BootstrapCluster(baseCertDir string, kw KeyWriter) error {
+func BootstrapCluster(baseCertDir string, kek []byte, headerUpdater KeyHeaderUpdater) error {
 	paths := NewConfigPaths(baseCertDir)
 
 	rootCA, err := CreateAndWriteRootCA(rootCN, paths.RootCA)
@@ -554,7 +554,7 @@ func BootstrapCluster(baseCertDir string, kw KeyWriter) error {
 
 	nodeID := identity.NewID()
 	newOrg := identity.NewID()
-	_, err = GenerateAndSignNewTLSCert(rootCA, nodeID, ManagerRole, newOrg, kw)
+	_, err = GenerateAndSignNewTLSCert(rootCA, nodeID, ManagerRole, newOrg, NewKeyReadWriter(paths.Node, kek, headerUpdater))
 	return err
 }
 

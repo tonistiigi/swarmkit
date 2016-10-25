@@ -136,7 +136,7 @@ func TestGenerateAndSignNewTLSCert(t *testing.T) {
 	rootCA, err := ca.CreateAndWriteRootCA("rootCN", paths.RootCA)
 	assert.NoError(t, err)
 
-	_, err = ca.GenerateAndSignNewTLSCert(rootCA, "CN", "OU", "ORG", ca.NewKeyReadWriter(paths.Node, nil))
+	_, err = ca.GenerateAndSignNewTLSCert(rootCA, "CN", "OU", "ORG", ca.NewKeyReadWriter(paths.Node, nil, nil))
 	assert.NoError(t, err)
 
 	perms, err := permbits.Stat(paths.Node.Cert)
@@ -296,7 +296,7 @@ func TestRequestAndSaveNewCertificates(t *testing.T) {
 	assert.NotEmpty(t, <-info)
 
 	// there was no encryption config in the remote, so the key should be unencrypted
-	unencryptedKeyReader := ca.NewKeyReadWriter(tc.Paths.Node, nil)
+	unencryptedKeyReader := ca.NewKeyReadWriter(tc.Paths.Node, nil, nil)
 	_, _, err = unencryptedKeyReader.Read()
 	require.NoError(t, err)
 
@@ -328,7 +328,7 @@ func TestRequestAndSaveNewCertificates(t *testing.T) {
 	_, _, err = unencryptedKeyReader.Read()
 	require.Error(t, err)
 
-	_, _, err = ca.NewKeyReadWriter(tc.Paths.Node, []byte("kek!")).Read()
+	_, _, err = ca.NewKeyReadWriter(tc.Paths.Node, []byte("kek!"), nil).Read()
 	require.NoError(t, err)
 
 	// if it's a worker though, the key is always unencrypted, even though the manager key is encrypted
@@ -476,7 +476,7 @@ func TestBootstrapCluster(t *testing.T) {
 
 	paths := ca.NewConfigPaths(tempBaseDir)
 
-	err = ca.BootstrapCluster(tempBaseDir, ca.NewKeyReadWriter(paths.Node, nil))
+	err = ca.BootstrapCluster(tempBaseDir, nil, nil)
 	assert.NoError(t, err)
 
 	perms, err := permbits.Stat(paths.RootCA.Cert)
@@ -545,7 +545,7 @@ func TestNewRootCABundle(t *testing.T) {
 	assert.Equal(t, 2, len(diskRootCA.Pool.Subjects()))
 
 	// If I use GenerateAndSignNewTLSCert to sign certs, I'll get the correct CA in the chain
-	kw := ca.NewKeyReadWriter(paths.Node, nil)
+	kw := ca.NewKeyReadWriter(paths.Node, nil, nil)
 	_, err = ca.GenerateAndSignNewTLSCert(diskRootCA, "CN", "OU", "ORG", kw)
 	assert.NoError(t, err)
 

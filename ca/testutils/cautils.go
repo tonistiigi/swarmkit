@@ -124,7 +124,7 @@ func NewTestCA(t *testing.T) *TestCA {
 		}
 	}
 
-	krw := ca.NewKeyReadWriter(paths.Node, nil)
+	krw := ca.NewKeyReadWriter(paths.Node, nil, nil)
 
 	managerConfig, err := genSecurityConfig(s, rootCA, krw, ca.ManagerRole, organization, "", External)
 	assert.NoError(t, err)

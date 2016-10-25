@@ -53,9 +53,9 @@ const (
 type SecurityConfig struct {
 	mu sync.Mutex
 
-	rootCA     *RootCA
-	externalCA *ExternalCA
-	keyWriter  *KeyReadWriter
+	rootCA        *RootCA
+	externalCA    *ExternalCA
+	keyReadWriter *KeyReadWriter
 
 	ServerTLSCreds *MutableTLSCreds
 	ClientTLSCreds *MutableTLSCreds
@@ -69,7 +69,7 @@ type CertificateUpdate struct {
 }
 
 // NewSecurityConfig initializes and returns a new SecurityConfig.
-func NewSecurityConfig(rootCA *RootCA, kw *KeyReadWriter, clientTLSCreds, serverTLSCreds *MutableTLSCreds) *SecurityConfig {
+func NewSecurityConfig(rootCA *RootCA, krw *KeyReadWriter, clientTLSCreds, serverTLSCreds *MutableTLSCreds) *SecurityConfig {
 	// Make a new TLS config for the external CA client without a
 	// ServerName value set.
 	clientTLSConfig := clientTLSCreds.Config()
@@ -82,7 +82,7 @@ func NewSecurityConfig(rootCA *RootCA, kw *KeyReadWriter, clientTLSCreds, server
 
 	return &SecurityConfig{
 		rootCA:         rootCA,
-		keyWriter:      kw,
+		keyReadWriter:  krw,
 		externalCA:     NewExternalCA(rootCA, externalCATLSConfig),
 		ClientTLSCreds: clientTLSCreds,
 		ServerTLSCreds: serverTLSCreds,
@@ -102,7 +102,15 @@ func (s *SecurityConfig) KeyWriter() KeyWriter {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.keyWriter
+	return s.keyReadWriter
+}
+
+// KeyReader returns the object that can read keys from disk
+func (s *SecurityConfig) KeyReader() KeyReader {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.keyReadWriter
 }
 
 // UpdateRootCA replaces the root CA with a new root CA based on the specified
@@ -193,7 +201,7 @@ func getCAHashFromToken(token string) (digest.Digest, error) {
 // LoadOrCreateSecurityConfig encapsulates the security logic behind joining a cluster.
 // Every node requires at least a set of TLS certificates with which to join the cluster with.
 // In the case of a manager, these certificates will be used both for client and server credentials.
-func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, token, proposedRole string, remotes remotes.Remotes, nodeInfo chan<- api.IssueNodeCertificateResponse, kek []byte) (*SecurityConfig, error) {
+func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, token, proposedRole string, remotes remotes.Remotes, nodeInfo chan<- api.IssueNodeCertificateResponse, kek []byte, headerUpdater KeyHeaderUpdater) (*SecurityConfig, error) {
 	ctx = log.WithModule(ctx, "tls")
 	paths := NewConfigPaths(baseCertDir)
 
@@ -248,7 +256,7 @@ func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, token, propose
 		return nil, err
 	}
 
-	krw := NewKeyReadWriter(paths.Node, kek)
+	krw := NewKeyReadWriter(paths.Node, kek, headerUpdater)
 
 	// At this point we've successfully loaded the CA details from disk, or
 	// successfully downloaded them remotely. The next step is to try to
@@ -327,6 +335,76 @@ func LoadOrCreateSecurityConfig(ctx context.Context, baseCertDir, token, propose
 	return NewSecurityConfig(&rootCA, krw, clientTLSCreds, serverTLSCreds), nil
 }
 
+// RenewTLSConfigNow gets a new TLS cert and key, and updates the security config if provided.  This is similar to
+// RenewTLSConfig, except while that monitors for expiry, and periodically renews, this renews once and is blocking
+func RenewTLSConfigNow(ctx context.Context, s *SecurityConfig, r remotes.Remotes, updates chan CertificateUpdate) error {
+	ctx = log.WithModule(ctx, "tls")
+	log := log.G(ctx).WithFields(logrus.Fields{
+		"node.id":   s.ClientTLSCreds.NodeID(),
+		"node.role": s.ClientTLSCreds.Role(),
+	})
+
+	// Let's request new certs. Renewals don't require a token.
+	rootCA := s.RootCA()
+	tlsKeyPair, err := rootCA.RequestAndSaveNewCertificates(ctx,
+		s.KeyWriter(),
+		"",
+		r,
+		s.ClientTLSCreds,
+		nil)
+	if err != nil {
+		log.WithError(err).Errorf("failed to renew the certificate")
+		if updates != nil {
+			updates <- CertificateUpdate{Err: err}
+		}
+		return err
+	}
+
+	clientTLSConfig, err := NewClientTLSConfig(tlsKeyPair, rootCA.Pool, CARole)
+	if err != nil {
+		log.WithError(err).Errorf("failed to create a new client config")
+		if updates != nil {
+			updates <- CertificateUpdate{Err: err}
+		}
+	}
+	serverTLSConfig, err := NewServerTLSConfig(tlsKeyPair, rootCA.Pool)
+	if err != nil {
+		log.WithError(err).Errorf("failed to create a new server config")
+		if updates != nil {
+			updates <- CertificateUpdate{Err: err}
+		}
+	}
+
+	err = s.ClientTLSCreds.LoadNewTLSConfig(clientTLSConfig)
+	if err != nil {
+		log.WithError(err).Errorf("failed to update the client credentials")
+		if updates != nil {
+			updates <- CertificateUpdate{Err: err}
+		}
+	}
+
+	// Update the external CA to use the new client TLS
+	// config using a copy without a serverName specified.
+	s.externalCA.UpdateTLSConfig(&tls.Config{
+		Certificates: clientTLSConfig.Certificates,
+		RootCAs:      clientTLSConfig.RootCAs,
+		MinVersion:   tls.VersionTLS12,
+	})
+
+	err = s.ServerTLSCreds.LoadNewTLSConfig(serverTLSConfig)
+	if err != nil {
+		log.WithError(err).Errorf("failed to update the server TLS credentials")
+		if updates != nil {
+			updates <- CertificateUpdate{Err: err}
+		}
+	}
+
+	if updates != nil {
+		updates <- CertificateUpdate{Role: s.ClientTLSCreds.Role()}
+	}
+	return nil
+}
+
 // RenewTLSConfig will continuously monitor for the necessity of renewing the local certificates, either by
 // issuing them locally if key-material is available, or requesting them from a remote CA.
 func RenewTLSConfig(ctx context.Context, s *SecurityConfig, baseCertDir string, remotes remotes.Remotes, renew <-chan struct{}) <-chan CertificateUpdate {
@@ -379,52 +457,8 @@ func RenewTLSConfig(ctx context.Context, s *SecurityConfig, baseCertDir string, 
 				return
 			}
 
-			// Let's request new certs. Renewals don't require a token.
-			rootCA := s.RootCA()
-			tlsKeyPair, err := rootCA.RequestAndSaveNewCertificates(ctx,
-				s.KeyWriter(),
-				"",
-				remotes,
-				s.ClientTLSCreds,
-				nil)
-			if err != nil {
-				log.WithError(err).Errorf("failed to renew the certificate")
-				updates <- CertificateUpdate{Err: err}
-				continue
-			}
-
-			clientTLSConfig, err := NewClientTLSConfig(tlsKeyPair, rootCA.Pool, CARole)
-			if err != nil {
-				log.WithError(err).Errorf("failed to create a new client config")
-				updates <- CertificateUpdate{Err: err}
-			}
-			serverTLSConfig, err := NewServerTLSConfig(tlsKeyPair, rootCA.Pool)
-			if err != nil {
-				log.WithError(err).Errorf("failed to create a new server config")
-				updates <- CertificateUpdate{Err: err}
-			}
-
-			err = s.ClientTLSCreds.LoadNewTLSConfig(clientTLSConfig)
-			if err != nil {
-				log.WithError(err).Errorf("failed to update the client credentials")
-				updates <- CertificateUpdate{Err: err}
-			}
-
-			// Update the external CA to use the new client TLS
-			// config using a copy without a serverName specified.
-			s.externalCA.UpdateTLSConfig(&tls.Config{
-				Certificates: clientTLSConfig.Certificates,
-				RootCAs:      clientTLSConfig.RootCAs,
-				MinVersion:   tls.VersionTLS12,
-			})
-
-			err = s.ServerTLSCreds.LoadNewTLSConfig(serverTLSConfig)
-			if err != nil {
-				log.WithError(err).Errorf("failed to update the server TLS credentials")
-				updates <- CertificateUpdate{Err: err}
-			}
-
-			updates <- CertificateUpdate{Role: s.ClientTLSCreds.Role()}
+			// ignore errors - it will just try again laster
+			RenewTLSConfigNow(ctx, s, remotes, updates)
 		}
 	}()
 
