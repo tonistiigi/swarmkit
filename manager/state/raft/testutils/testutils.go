@@ -29,12 +29,14 @@ import (
 // TestNode represents a raft test node
 type TestNode struct {
 	*raft.Node
-	Server         *grpc.Server
-	Listener       *WrappedListener
-	SecurityConfig *ca.SecurityConfig
-	Address        string
-	StateDir       string
-	cancel         context.CancelFunc
+	Server            *grpc.Server
+	Listener          *WrappedListener
+	SecurityConfig    *ca.SecurityConfig
+	Address           string
+	StateDir          string
+	cancel            context.CancelFunc
+	RaftEncryptionKey []byte
+	KeyRotator        raft.EncryptionKeyRotator
 }
 
 // Leader is wrapper around real Leader method to suppress error.
@@ -233,6 +235,7 @@ func NewNode(t *testing.T, clockSource *fakeclock.FakeClock, tc *cautils.TestCA,
 	}
 	if len(opts) == 1 {
 		newNodeOpts.JoinAddr = opts[0].JoinAddr
+		newNodeOpts.KeyRotator = opts[0].KeyRotator
 		if opts[0].Addr != "" {
 			newNodeOpts.Addr = opts[0].Addr
 		}
@@ -252,12 +255,14 @@ func NewNode(t *testing.T, clockSource *fakeclock.FakeClock, tc *cautils.TestCA,
 	healthServer.SetServingStatus("Raft", api.HealthCheckResponse_SERVING)
 
 	return &TestNode{
-		Node:           n,
-		Listener:       wrappedListener,
-		SecurityConfig: securityConfig,
-		Address:        newNodeOpts.Addr,
-		StateDir:       newNodeOpts.StateDir,
-		Server:         s,
+		Node:              n,
+		Listener:          wrappedListener,
+		SecurityConfig:    securityConfig,
+		Address:           newNodeOpts.Addr,
+		StateDir:          newNodeOpts.StateDir,
+		Server:            s,
+		RaftEncryptionKey: []byte("test encryption key"),
+		KeyRotator:        newNodeOpts.KeyRotator,
 	}
 }
 
@@ -269,7 +274,7 @@ func NewInitNode(t *testing.T, tc *cautils.TestCA, raftConfig *api.RaftConfig, o
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
 
-	err := n.Node.JoinAndStart(ctx)
+	err := n.Node.JoinAndStart(ctx, n.RaftEncryptionKey)
 	require.NoError(t, err, "can't join cluster")
 
 	leadershipCh, cancel := n.SubscribeLeadership()
@@ -308,7 +313,7 @@ func NewJoinNode(t *testing.T, clockSource *fakeclock.FakeClock, join string, tc
 
 	ctx, cancel := context.WithCancel(context.Background())
 	n.cancel = cancel
-	err := n.Node.JoinAndStart(ctx)
+	err := n.Node.JoinAndStart(ctx, n.RaftEncryptionKey)
 	require.NoError(t, err, "can't join cluster")
 
 	go n.Run(ctx)
@@ -316,8 +321,8 @@ func NewJoinNode(t *testing.T, clockSource *fakeclock.FakeClock, join string, tc
 	return n
 }
 
-// RestartNode restarts a raft test node
-func RestartNode(t *testing.T, clockSource *fakeclock.FakeClock, oldNode *TestNode, forceNewCluster bool) *TestNode {
+// CopyNode returns a copy of a node
+func CopyNode(t *testing.T, clockSource *fakeclock.FakeClock, oldNode *TestNode, forceNewCluster bool) (*TestNode, context.Context) {
 	wrappedListener := RecycleWrappedListener(oldNode.Listener)
 	securityConfig := oldNode.SecurityConfig
 	serverOpts := []grpc.ServerOption{grpc.Creds(securityConfig.ServerTLSCreds)}
@@ -334,6 +339,7 @@ func RestartNode(t *testing.T, clockSource *fakeclock.FakeClock, oldNode *TestNo
 		ClockSource:     clockSource,
 		SendTimeout:     10 * time.Second,
 		TLSCredentials:  securityConfig.ClientTLSCreds,
+		KeyRotator:      oldNode.KeyRotator,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -345,25 +351,34 @@ func RestartNode(t *testing.T, clockSource *fakeclock.FakeClock, oldNode *TestNo
 
 	go func() {
 		// After stopping, we should receive an error from Serve
-		assert.Error(t, s.Serve(wrappedListener))
+		require.Error(t, s.Serve(wrappedListener))
 	}()
 
 	healthServer.SetServingStatus("Raft", api.HealthCheckResponse_SERVING)
 
-	err := n.JoinAndStart(ctx)
+	return &TestNode{
+		Node:              n,
+		Listener:          wrappedListener,
+		SecurityConfig:    securityConfig,
+		Address:           newNodeOpts.Addr,
+		StateDir:          newNodeOpts.StateDir,
+		cancel:            cancel,
+		Server:            s,
+		RaftEncryptionKey: oldNode.RaftEncryptionKey,
+		KeyRotator:        oldNode.KeyRotator,
+	}, ctx
+}
+
+// RestartNode restarts a raft test node
+func RestartNode(t *testing.T, clockSource *fakeclock.FakeClock, oldNode *TestNode, forceNewCluster bool) *TestNode {
+	n, ctx := CopyNode(t, clockSource, oldNode, forceNewCluster)
+
+	err := n.Node.JoinAndStart(ctx, n.RaftEncryptionKey)
 	require.NoError(t, err, "can't join cluster")
 
-	go n.Run(ctx)
+	go n.Node.Run(ctx)
 
-	return &TestNode{
-		Node:           n,
-		Listener:       wrappedListener,
-		SecurityConfig: securityConfig,
-		Address:        newNodeOpts.Addr,
-		StateDir:       newNodeOpts.StateDir,
-		cancel:         cancel,
-		Server:         s,
-	}
+	return n
 }
 
 // NewRaftCluster creates a new raft cluster with 3 nodes for testing

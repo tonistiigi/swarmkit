@@ -23,6 +23,7 @@ import (
 	"github.com/docker/swarmkit/manager/state/store"
 	"github.com/phayes/permbits"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/net/context"
 )
 
@@ -135,7 +136,7 @@ func TestGenerateAndSignNewTLSCert(t *testing.T) {
 	rootCA, err := ca.CreateAndWriteRootCA("rootCN", paths.RootCA)
 	assert.NoError(t, err)
 
-	_, err = ca.GenerateAndSignNewTLSCert(rootCA, "CN", "OU", "ORG", paths.Node)
+	_, err = ca.GenerateAndSignNewTLSCert(rootCA, "CN", "OU", "ORG", ca.NewKeyReadWriter(paths.Node, nil, nil))
 	assert.NoError(t, err)
 
 	perms, err := permbits.Stat(paths.Node.Cert)
@@ -158,35 +159,12 @@ func TestGenerateAndSignNewTLSCert(t *testing.T) {
 	assert.Equal(t, "rootCN", certs[1].Subject.CommonName)
 }
 
-func TestGenerateAndWriteNewKey(t *testing.T) {
-	tempBaseDir, err := ioutil.TempDir("", "swarm-ca-test-")
-	assert.NoError(t, err)
-	defer os.RemoveAll(tempBaseDir)
-
-	paths := ca.NewConfigPaths(tempBaseDir)
-
-	csr, key, err := ca.GenerateAndWriteNewKey(paths.Node)
-	assert.NoError(t, err)
-	assert.NotNil(t, csr)
-	assert.NotNil(t, key)
-
-	perms, err := permbits.Stat(paths.Node.Key)
-	assert.NoError(t, err)
-	assert.False(t, perms.GroupRead())
-	assert.False(t, perms.OtherRead())
-
-	_, err = helpers.ParseCSRPEM(csr)
-	assert.NoError(t, err)
-}
-
 func TestEncryptECPrivateKey(t *testing.T) {
 	tempBaseDir, err := ioutil.TempDir("", "swarm-ca-test-")
 	assert.NoError(t, err)
 	defer os.RemoveAll(tempBaseDir)
 
-	paths := ca.NewConfigPaths(tempBaseDir)
-
-	_, key, err := ca.GenerateAndWriteNewKey(paths.Node)
+	_, key, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 	encryptedKey, err := ca.EncryptECPrivateKey(key, "passphrase")
 	assert.NoError(t, err)
@@ -207,7 +185,7 @@ func TestParseValidateAndSignCSR(t *testing.T) {
 	rootCA, err := ca.CreateAndWriteRootCA("rootCN", paths.RootCA)
 	assert.NoError(t, err)
 
-	csr, _, err := ca.GenerateAndWriteNewKey(paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	signedCert, err := rootCA.ParseValidateAndSignCSR(csr, "CN", "OU", "ORG")
@@ -308,7 +286,7 @@ func TestRequestAndSaveNewCertificates(t *testing.T) {
 	info := make(chan api.IssueNodeCertificateResponse, 1)
 	// Copy the current RootCA without the signer
 	rca := ca.RootCA{Cert: tc.RootCA.Cert, Pool: tc.RootCA.Pool}
-	cert, err := rca.RequestAndSaveNewCertificates(tc.Context, tc.Paths.Node, tc.WorkerToken, tc.Remotes, nil, info)
+	cert, err := rca.RequestAndSaveNewCertificates(tc.Context, tc.KeyReadWriter, tc.ManagerToken, tc.Remotes, nil, info)
 	assert.NoError(t, err)
 	assert.NotNil(t, cert)
 	perms, err := permbits.Stat(tc.Paths.Node.Cert)
@@ -316,6 +294,49 @@ func TestRequestAndSaveNewCertificates(t *testing.T) {
 	assert.False(t, perms.GroupWrite())
 	assert.False(t, perms.OtherWrite())
 	assert.NotEmpty(t, <-info)
+
+	// there was no encryption config in the remote, so the key should be unencrypted
+	unencryptedKeyReader := ca.NewKeyReadWriter(tc.Paths.Node, nil, nil)
+	_, _, err = unencryptedKeyReader.Read()
+	require.NoError(t, err)
+
+	// the worker token is also unencrypted
+	cert, err = rca.RequestAndSaveNewCertificates(tc.Context, tc.KeyReadWriter, tc.WorkerToken, tc.Remotes, nil, info)
+	assert.NoError(t, err)
+	assert.NotNil(t, cert)
+	assert.NotEmpty(t, <-info)
+	_, _, err = unencryptedKeyReader.Read()
+	require.NoError(t, err)
+
+	// If there is a different kek in the remote store, when TLS certs are renewed the new key will
+	// be encrypted with that kek
+	assert.NoError(t, tc.MemoryStore.Update(func(tx store.Tx) error {
+		cluster := store.GetCluster(tx, tc.Organization)
+		cluster.Spec.EncryptionConfig = api.EncryptionConfig{
+			ManagerUnlockKey: []byte("kek!"),
+		}
+		return store.UpdateCluster(tx, cluster)
+	}))
+	assert.NoError(t, os.RemoveAll(tc.Paths.Node.Cert))
+	assert.NoError(t, os.RemoveAll(tc.Paths.Node.Key))
+
+	_, err = rca.RequestAndSaveNewCertificates(tc.Context, tc.KeyReadWriter, tc.ManagerToken, tc.Remotes, nil, info)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, <-info)
+
+	// key can no longer be read without a kek
+	_, _, err = unencryptedKeyReader.Read()
+	require.Error(t, err)
+
+	_, _, err = ca.NewKeyReadWriter(tc.Paths.Node, []byte("kek!"), nil).Read()
+	require.NoError(t, err)
+
+	// if it's a worker though, the key is always unencrypted, even though the manager key is encrypted
+	_, err = rca.RequestAndSaveNewCertificates(tc.Context, tc.KeyReadWriter, tc.WorkerToken, tc.Remotes, nil, info)
+	assert.NoError(t, err)
+	assert.NotEmpty(t, <-info)
+	_, _, err = unencryptedKeyReader.Read()
+	require.NoError(t, err)
 }
 
 func TestIssueAndSaveNewCertificates(t *testing.T) {
@@ -323,7 +344,7 @@ func TestIssueAndSaveNewCertificates(t *testing.T) {
 	defer tc.Stop()
 
 	// Test the creation of a manager certificate
-	cert, err := tc.RootCA.IssueAndSaveNewCertificates(tc.Paths.Node, "CN", ca.ManagerRole, tc.Organization)
+	cert, err := tc.RootCA.IssueAndSaveNewCertificates(tc.KeyReadWriter, "CN", ca.ManagerRole, tc.Organization)
 	assert.NoError(t, err)
 	assert.NotNil(t, cert)
 	perms, err := permbits.Stat(tc.Paths.Node.Cert)
@@ -345,7 +366,7 @@ func TestIssueAndSaveNewCertificates(t *testing.T) {
 	assert.Contains(t, certs[0].DNSNames, "swarm-manager")
 
 	// Test the creation of a worker node cert
-	cert, err = tc.RootCA.IssueAndSaveNewCertificates(tc.Paths.Node, "CN", ca.WorkerRole, tc.Organization)
+	cert, err = tc.RootCA.IssueAndSaveNewCertificates(tc.KeyReadWriter, "CN", ca.WorkerRole, tc.Organization)
 	assert.NoError(t, err)
 	assert.NotNil(t, cert)
 	perms, err = permbits.Stat(tc.Paths.Node.Cert)
@@ -372,7 +393,7 @@ func TestGetRemoteSignedCertificate(t *testing.T) {
 	defer tc.Stop()
 
 	// Create a new CSR to be signed
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	certs, err := ca.GetRemoteSignedCertificate(context.Background(), csr, tc.ManagerToken, tc.RootCA.Pool, tc.Remotes, nil, nil)
@@ -404,7 +425,7 @@ func TestGetRemoteSignedCertificateNodeInfo(t *testing.T) {
 	defer tc.Stop()
 
 	// Create a new CSR to be signed
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	info := make(chan api.IssueNodeCertificateResponse, 1)
@@ -421,7 +442,7 @@ func TestGetRemoteSignedCertificateWithPending(t *testing.T) {
 	defer tc.Stop()
 
 	// Create a new CSR to be signed
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	updates, cancel := state.Watch(tc.MemoryStore.WatchQueue(), state.EventCreateNode{})
@@ -455,7 +476,7 @@ func TestBootstrapCluster(t *testing.T) {
 
 	paths := ca.NewConfigPaths(tempBaseDir)
 
-	err = ca.BootstrapCluster(tempBaseDir)
+	err = ca.BootstrapCluster(tempBaseDir, nil, nil)
 	assert.NoError(t, err)
 
 	perms, err := permbits.Stat(paths.RootCA.Cert)
@@ -524,7 +545,8 @@ func TestNewRootCABundle(t *testing.T) {
 	assert.Equal(t, 2, len(diskRootCA.Pool.Subjects()))
 
 	// If I use GenerateAndSignNewTLSCert to sign certs, I'll get the correct CA in the chain
-	_, err = ca.GenerateAndSignNewTLSCert(diskRootCA, "CN", "OU", "ORG", paths.Node)
+	kw := ca.NewKeyReadWriter(paths.Node, nil, nil)
+	_, err = ca.GenerateAndSignNewTLSCert(diskRootCA, "CN", "OU", "ORG", kw)
 	assert.NoError(t, err)
 
 	certBytes, err := ioutil.ReadFile(paths.Node.Cert)
@@ -553,7 +575,7 @@ func TestNewRootCANonDefaultExpiry(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Create and sign a new CSR
-	csr, _, err := ca.GenerateAndWriteNewKey(paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 	cert, err := newRootCA.ParseValidateAndSignCSR(csr, "CN", ca.ManagerRole, "ORG")
 	assert.NoError(t, err)

@@ -14,6 +14,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var _ api.CAServer = &ca.Server{}
+var _ api.NodeCAServer = &ca.Server{}
+
 func TestGetRootCACertificate(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
@@ -43,7 +46,7 @@ func TestIssueNodeCertificate(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
 
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	issueRequest := &api.IssueNodeCertificateRequest{CSR: csr, Token: tc.WorkerToken}
@@ -68,7 +71,7 @@ func TestIssueNodeCertificateBrokenCA(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
 
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	tc.ExternalSigningServer.Flake()
@@ -114,7 +117,7 @@ func TestIssueNodeCertificateWorkerRenewal(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
 
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	role := api.NodeRoleWorker
@@ -136,7 +139,7 @@ func TestIssueNodeCertificateManagerRenewal(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
 
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 	assert.NotNil(t, csr)
 
@@ -159,7 +162,7 @@ func TestIssueNodeCertificateWorkerFromDifferentOrgRenewal(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
 
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	// Since we're using a client that has a different Organization, this request will be treated
@@ -173,7 +176,7 @@ func TestNodeCertificateRenewalsDoNotRequireToken(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
 
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	role := api.NodeRoleManager
@@ -211,7 +214,7 @@ func TestNewNodeCertificateRequiresToken(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
 
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	// Issuance fails if no secret is provided
@@ -290,7 +293,7 @@ func TestNewNodeCertificateBadToken(t *testing.T) {
 	tc := testutils.NewTestCA(t)
 	defer tc.Stop()
 
-	csr, _, err := ca.GenerateAndWriteNewKey(tc.Paths.Node)
+	csr, _, err := ca.GenerateNewCSR()
 	assert.NoError(t, err)
 
 	// Issuance fails if wrong secret is provided
@@ -303,4 +306,34 @@ func TestNewNodeCertificateBadToken(t *testing.T) {
 	issueRequest = &api.IssueNodeCertificateRequest{CSR: csr, Role: role, Token: "invalid-secret"}
 	_, err = tc.NodeCAClients[0].IssueNodeCertificate(context.Background(), issueRequest)
 	assert.EqualError(t, err, "rpc error: code = 3 desc = A valid join token is necessary to join this cluster")
+}
+
+func TestGetEncryptionConfig(t *testing.T) {
+	t.Parallel()
+
+	tc := testutils.NewTestCA(t)
+	defer tc.Stop()
+
+	resp, err := tc.NodeCAClients[0].GetEncryptionConfig(context.Background(), &api.GetEncryptionConfigRequest{})
+	assert.NoError(t, err)
+	assert.NotNil(t, resp.EncryptionConfig)
+	assert.Equal(t, api.EncryptionConfig{}, *resp.EncryptionConfig)
+
+	for _, passphrase := range [][]byte{nil, []byte("secret")} {
+		// Update encryption config
+		assert.NoError(t, tc.MemoryStore.Update(func(tx store.Tx) error {
+			clusters, _ := store.FindClusters(tx, store.ByName(store.DefaultClusterName))
+			clusters[0].Spec.EncryptionConfig = api.EncryptionConfig{
+				ManagerUnlockKey: passphrase,
+			}
+			return store.UpdateCluster(tx, clusters[0])
+		}))
+
+		time.Sleep(500 * time.Millisecond)
+
+		resp, err = tc.NodeCAClients[0].GetEncryptionConfig(context.Background(), &api.GetEncryptionConfigRequest{})
+		assert.NoError(t, err)
+		assert.NotNil(t, resp.EncryptionConfig)
+		assert.Equal(t, passphrase, resp.EncryptionConfig.ManagerUnlockKey)
+	}
 }

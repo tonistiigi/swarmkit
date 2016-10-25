@@ -19,6 +19,7 @@ import (
 	"github.com/docker/swarmkit/manager/dispatcher"
 	"github.com/docker/swarmkit/manager/state/store"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestManager(t *testing.T) {
@@ -40,7 +41,7 @@ func TestManager(t *testing.T) {
 	assert.NoError(t, err)
 	defer os.RemoveAll(stateDir)
 
-	tc := testutils.NewTestCA(t)
+	tc := testutils.NewTestCA(t, []byte("kek"))
 	defer tc.Stop()
 
 	agentSecurityConfig, err := tc.NewNodeConfig(ca.WorkerRole)
@@ -134,6 +135,17 @@ func TestManager(t *testing.T) {
 		assert.NoError(t, controlConn.Close())
 	}()
 
+	// check that the kek is added to the config
+	var cluster api.Cluster
+	m.raftNode.MemoryStore().View(func(tx store.ReadTx) {
+		clusters, err := store.FindClusters(tx, store.All)
+		require.NoError(t, err)
+		require.Len(t, clusters, 1)
+		cluster = *clusters[0]
+	})
+	require.NotNil(t, cluster)
+	require.Equal(t, cluster.Spec.EncryptionConfig.ManagerUnlockKey, []byte("kek"))
+
 	// Test removal of the agent node
 	agentID := agentSecurityConfig.ClientTLSCreds.NodeID()
 	assert.NoError(t, m.raftNode.MemoryStore().Update(func(tx store.Tx) error {
@@ -166,4 +178,72 @@ func TestManager(t *testing.T) {
 	// all this happened before WaitForLeader completed, so don't check the
 	// error.
 	<-done
+}
+
+func TestMaintainEncryptedPEMHeaders(t *testing.T) {
+	sampleHeaderValueEncrypted, err := encodePEMHeaderValue([]byte("DEK"), []byte("original KEK"))
+	require.NoError(t, err)
+	sampleHeaderValueUnencrypted, err := encodePEMHeaderValue([]byte("DEK"), nil)
+	require.NoError(t, err)
+
+	// if there are no headers, nothing is done
+	headers := map[string]string{}
+	require.NoError(t, MaintainEncryptedPEMHeaders(headers, nil, []byte("new KEK")))
+	require.Empty(t, headers)
+
+	// if there is a pending header, it gets re-encrypted even if there is no DEK
+	headers = map[string]string{defaultRaftDekKeyPending: sampleHeaderValueUnencrypted}
+	require.NoError(t, MaintainEncryptedPEMHeaders(headers, nil, []byte("new KEK")))
+	require.Len(t, headers, 1)
+	decoded, err := decodePEMHeaderValue(headers[defaultRaftDekKeyPending], []byte("new KEK"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("DEK"), decoded)
+
+	// if there is a regular header, it gets re-encrypted and no new headers are added if the original kek was not nil
+	headers = map[string]string{defaultRaftDEKKey: sampleHeaderValueEncrypted}
+	require.NoError(t, MaintainEncryptedPEMHeaders(headers, []byte("original KEK"), []byte("new KEK")))
+	require.Len(t, headers, 1)
+	decoded, err = decodePEMHeaderValue(headers[defaultRaftDEKKey], []byte("new KEK"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("DEK"), decoded)
+
+	// if there is a regular header and no pending header, the regular header gets re-encrypted and a pending header is added
+	headers = map[string]string{defaultRaftDEKKey: sampleHeaderValueUnencrypted}
+	require.NoError(t, MaintainEncryptedPEMHeaders(headers, nil, []byte("new KEK")))
+	require.Len(t, headers, 2)
+	decoded, err = decodePEMHeaderValue(headers[defaultRaftDEKKey], []byte("new KEK"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("DEK"), decoded)
+	decoded, err = decodePEMHeaderValue(headers[defaultRaftDekKeyPending], []byte("new KEK"))
+	require.NoError(t, err)
+	require.NotEqual(t, []byte("DEK"), decoded) // randomly generated
+
+	// both headers get re-encrypted, if both are present, and no new key is created
+	headers = map[string]string{
+		defaultRaftDEKKey:        sampleHeaderValueUnencrypted,
+		defaultRaftDekKeyPending: sampleHeaderValueUnencrypted,
+	}
+	require.NoError(t, MaintainEncryptedPEMHeaders(headers, nil, []byte("new KEK")))
+	require.Len(t, headers, 2)
+	decoded, err = decodePEMHeaderValue(headers[defaultRaftDekKeyPending], []byte("new KEK"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("DEK"), decoded)
+	decoded, err = decodePEMHeaderValue(headers[defaultRaftDEKKey], []byte("new KEK"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("DEK"), decoded)
+
+	// if we can't decrypt either one, fail
+	headers = map[string]string{
+		defaultRaftDEKKey:        sampleHeaderValueUnencrypted,
+		defaultRaftDekKeyPending: sampleHeaderValueEncrypted,
+	}
+	require.Error(t, MaintainEncryptedPEMHeaders(headers, nil, []byte("original KEK")))
+
+	// if we're going from encrypted to unencrypted, the DEK does not need to be rotated
+	headers = map[string]string{defaultRaftDEKKey: sampleHeaderValueEncrypted}
+	require.NoError(t, MaintainEncryptedPEMHeaders(headers, []byte("original KEK"), nil))
+	require.Len(t, headers, 1)
+	decoded, err = decodePEMHeaderValue(headers[defaultRaftDEKKey], nil)
+	require.NoError(t, err)
+	require.Equal(t, []byte("DEK"), decoded)
 }

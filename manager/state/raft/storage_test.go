@@ -6,10 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/docker/swarmkit/api"
+	"github.com/docker/swarmkit/manager/state/raft"
 	raftutils "github.com/docker/swarmkit/manager/state/raft/testutils"
 	"github.com/docker/swarmkit/manager/state/store"
 	"github.com/pivotal-golang/clock/fakeclock"
@@ -118,7 +120,7 @@ func TestRaftSnapshot(t *testing.T) {
 				return fmt.Errorf("expected 1 snapshot, found %d on node %d", len(dirents), nodeID)
 			}
 			if dirents[0].Name() == snapshotFilenames[nodeID] {
-				return fmt.Errorf("snapshot %s did not get replaced", snapshotFilenames[nodeID])
+				return fmt.Errorf("snapshot %s did not get replaced on node %d", snapshotFilenames[nodeID], nodeID)
 			}
 			return nil
 		}))
@@ -437,23 +439,116 @@ func proposeLargeValue(t *testing.T, raftNode *raftutils.TestNode, time time.Dur
 	return node, nil
 }
 
-func TestMigrateWAL(t *testing.T) {
+type encryptionKeyQueue struct {
+	mu           sync.Mutex
+	newKey       []byte
+	rotationChan chan struct{}
+}
+
+func (e *encryptionKeyQueue) enqueue(newKey []byte) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.newKey = newKey
+}
+
+func (e *encryptionKeyQueue) GetNewKey() []byte {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.newKey
+}
+
+func (e *encryptionKeyQueue) FinishKeyRotation([]byte) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.newKey = nil
+	return nil
+}
+
+func (e *encryptionKeyQueue) RotationNotify() chan struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.rotationChan
+}
+
+func TestRaftEncryptionKeyRotation(t *testing.T) {
+	t.Parallel()
+
 	nodes := make(map[uint64]*raftutils.TestNode)
 	var clockSource *fakeclock.FakeClock
 
-	nodes[1], clockSource = raftutils.NewInitNode(t, tc, nil)
+	rotator := &encryptionKeyQueue{
+		rotationChan: make(chan struct{}),
+	}
+
+	raftConfig := raft.DefaultRaftConfig()
+	raftConfig.KeepOldSnapshots = 10
+	nodes[1], clockSource = raftutils.NewInitNode(t, tc, &raftConfig, raft.NodeOptions{
+		KeyRotator: rotator,
+	})
 	defer raftutils.TeardownCluster(t, nodes)
 
-	value, err := raftutils.ProposeValue(t, nodes[1], DefaultProposalTime, "id1")
-	assert.NoError(t, err, "failed to propose value")
-	raftutils.CheckValuesOnNodes(t, clockSource, nodes, []string{"id1"}, []*api.Node{value})
+	nodeIDs := []string{"id1", "id2", "id3", "id4"}
+	values := make([]*api.Node, len(nodeIDs))
+
+	// Propose 3 values
+	var err error
+	for i, nodeID := range nodeIDs[:3] {
+		values[i], err = raftutils.ProposeValue(t, nodes[1], DefaultProposalTime, nodeID)
+		require.NoError(t, err, "failed to propose value")
+	}
+
+	// rotate the encryption key
+	rotator.enqueue([]byte("key2"))
+	rotator.RotationNotify() <- struct{}{}
+
+	// the rotation should trigger a snapshot, which should notify the rotator when it's done
+	var snapshotname string
+	require.NoError(t, raftutils.PollFunc(clockSource, func() error {
+		dirents, err := ioutil.ReadDir(filepath.Join(nodes[1].StateDir, "snap-v3"))
+		if err != nil {
+			return err
+		}
+		if len(dirents) != 1 {
+			return fmt.Errorf("expected 1 snapshot, found %d on new node", len(dirents))
+		}
+		if rotator.GetNewKey() != nil {
+			return fmt.Errorf("rotation never finished")
+		}
+		snapshotname = dirents[0].Name()
+		return nil
+	}))
+	raftutils.CheckValuesOnNodes(t, clockSource, nodes, nodeIDs[:3], values[:3])
+
+	// Propose a 4th value
+	values[3], err = raftutils.ProposeValue(t, nodes[1], DefaultProposalTime, nodeIDs[3])
+	require.NoError(t, err, "failed to propose value")
+	raftutils.CheckValuesOnNodes(t, clockSource, nodes, nodeIDs, values)
 
 	nodes[1].Server.Stop()
 	nodes[1].ShutdownRaft()
 
-	// Move WAL directory so it looks like it was created by an old version
-	require.NoError(t, os.Rename(filepath.Join(nodes[1].StateDir, "wal-v3"), filepath.Join(nodes[1].StateDir, "wal")))
+	// Try to restart node 1. Without the new unlock key, it can't actually start
+	n, ctx := raftutils.CopyNode(t, clockSource, nodes[1], false)
+	require.Error(t, n.Node.JoinAndStart(ctx, nodes[1].RaftEncryptionKey), "should not have been able to restart since we can't read snapshots")
 
+	// with the right key, it can start, even if the right key is only an old decryption key
+	nodes[1].RaftEncryptionKey = []byte("key2")
 	nodes[1] = raftutils.RestartNode(t, clockSource, nodes[1], false)
-	raftutils.CheckValuesOnNodes(t, clockSource, nodes, []string{"id1"}, []*api.Node{value})
+
+	raftutils.WaitForCluster(t, clockSource, nodes)
+
+	raftutils.CheckValuesOnNodes(t, clockSource, nodes, nodeIDs, values)
+
+	// break snapshotting, and ensure that key rotation never finishes
+	os.RemoveAll(nodes[1].StateDir)
+	rotator.enqueue([]byte("key2"))
+	rotator.RotationNotify() <- struct{}{}
+
+	time.Sleep(250 * time.Millisecond)
+
+	// snapshot has not been recreated
+	_, err = ioutil.ReadDir(filepath.Join(nodes[1].StateDir, "snap-v3"))
+	require.True(t, os.IsNotExist(err))
+
+	require.NotNil(t, rotator.GetNewKey())
 }

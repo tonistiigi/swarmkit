@@ -31,7 +31,9 @@ func main() {
 
 	clusterID := identity.NewID()
 	nodeID := identity.NewID()
-	if _, err := ca.GenerateAndSignNewTLSCert(rootCA, nodeID, ca.ManagerRole, clusterID, nodeConfigPaths.Node); err != nil {
+
+	kw := ca.NewKeyReadWriter(nodeConfigPaths.Node, nil, nil)
+	if _, err := ca.GenerateAndSignNewTLSCert(rootCA, nodeID, ca.ManagerRole, clusterID, kw); err != nil {
 		log.Fatalf("unable to create initial manager node credentials: %s", err)
 	}
 
